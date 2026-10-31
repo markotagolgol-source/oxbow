@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+proof/
+imm5562*
+imm5669*
+IMM5562*
+IMM5669*
+*-filled.pdf
+*.filled.pdf
