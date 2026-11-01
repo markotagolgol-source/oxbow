@@ -88,6 +88,37 @@ def _under(node, stop, banned) -> bool:
     return False
 
 
+def _break_text(text: str) -> str:
+    """Keep paragraph and line breaks. Collapse ordinary spaces on each line.
+
+    U+2028 and U+2029 are the line and paragraph separators XFA puts in a
+    text run. A newline in a text node is the same kind of break.
+    """
+    if not text:
+        return ""
+    text = text.replace("\u2029", "\n").replace("\u2028", "\n")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return "\n".join(" ".join(line.split()) for line in text.split("\n"))
+
+
+def _rich_text(node) -> str:
+    parts = []
+    if node.text:
+        parts.append(node.text)
+    for child in node:
+        if not isinstance(child.tag, str):
+            if child.tail:
+                parts.append(child.tail)
+            continue
+        if local(child.tag) == "br":
+            parts.append("\n")
+        else:
+            parts.append(_rich_text(child))
+        if child.tail:
+            parts.append(child.tail)
+    return "".join(parts)
+
+
 def plain_text(el) -> str:
     """Visible words of a caption or value. Skips scripts and choice items."""
     if el is None:
@@ -97,8 +128,8 @@ def plain_text(el) -> str:
     for node in el.iter():
         if local(node.tag) != "p" or _under(node, el, banned):
             continue
-        words = " ".join("".join(node.itertext()).split())
-        if words:
+        words = _break_text(_rich_text(node)).strip("\n")
+        if words.strip():
             paragraphs.append(words)
     if paragraphs:
         return "\n".join(paragraphs)
@@ -108,16 +139,20 @@ def plain_text(el) -> str:
             continue
         if _under(node, el, banned):
             continue
-        chunks.append(" ".join(node.text.split()))
+        words = _break_text(node.text).strip("\n")
+        if words.strip():
+            chunks.append(words)
     if chunks:
         return chunks[0] if len(chunks) == 1 else "\n".join(chunks)
     for node in el.iter():
         if local(node.tag) != "exData" or not (node.text and "<" in node.text):
             continue
-        raw = re.sub(r"<[^>]+>", " ", node.text)
-        raw = " ".join(raw.split())
-        if raw:
-            return raw
+        raw = re.sub(r"(?i)<br\s*/?>", "\n", node.text)
+        raw = re.sub(r"(?i)</p\s*>", "\n", raw)
+        raw = re.sub(r"<[^>]+>", " ", raw)
+        words = _break_text(raw).strip("\n")
+        if words.strip():
+            return words
     return ""
 
 
@@ -209,12 +244,19 @@ def _image(el):
     return None, ""
 
 
-def _ui(el) -> str:
+def _ui_widget(el):
     node = _direct(el, "ui")
     if node is None:
-        return ""
-    kids = [child for child in node if isinstance(child.tag, str)]
-    return local(kids[0].tag) if kids else ""
+        return None
+    for child in node:
+        if isinstance(child.tag, str):
+            return child
+    return None
+
+
+def _ui(el) -> str:
+    widget = _ui_widget(el)
+    return local(widget.tag) if widget is not None else ""
 
 
 def _relevant_flags(el):
@@ -367,6 +409,12 @@ class Block:
     print_only: bool = False
     page_label: bool = False
     baseline: str = ""
+    # Border of the ui widget (the underline of a text edit, the box of a check).
+    # Edge order is top, right, bottom, left, the same as the field border.
+    ui_edges: tuple = ()
+    # checkButton size in millimetres. 0 means this is not an XFA check graphic.
+    # The specification default, when the attribute is omitted, is 10pt.
+    mark_size: float = 0.0
 
 
 @dataclass
@@ -380,6 +428,7 @@ class Page:
     content_h: float = 236.0
     page_w: float = PAGE_W
     page_h: float = PAGE_H
+    layout_issues: list = field(default_factory=list)
 
 
 @dataclass
@@ -467,6 +516,13 @@ def _leaf(el, avail, parts, group, index, force_w, natural) -> Frag:
     cap_text, cap_place, cap_reserve = "", "", 0.0
     cap_face, cap_size, cap_bold = "Arial", 8.0, False
     cap_align, cap_valign = "left", "middle"
+    widget = _ui_widget(el)
+    ui_edges = ()
+    mark_size = 0.0
+    if widget is not None:
+        ui_edges, _ui_fill = _border(widget)
+        if local(widget.tag) == "checkButton":
+            mark_size = parse_len(widget.get("size"), 10.0 * 25.4 / 72.0)
     cap = _direct(el, "caption")
     if cap is not None:
         cap_text = plain_text(cap).strip()
@@ -547,6 +603,8 @@ def _leaf(el, avail, parts, group, index, force_w, natural) -> Frag:
         screen_only=screen_only,
         print_only=print_only,
         page_label=(kind == "text" and shown.strip() in ("Page", "Page of")),
+        ui_edges=ui_edges if kind == "field" else (),
+        mark_size=mark_size if kind == "field" else 0.0,
     ))
     if kind == "button" and fill is None and any(edge[0] for edge in edges):
         frag.blocks[0].fill = (212, 208, 200)
@@ -578,6 +636,59 @@ def _center_check(frag, line_h):
         return
     if frag.blocks[0].ui in ("checkButton", "radio") and frag.h < line_h - 0.2:
         frag.y = (line_h - frag.h) / 2.0
+
+
+def _extend_line_rails(line):
+    """Continue a section's outer side rail down a line that is taller than the rail.
+
+    A checkbox keeps its own box, so its right edge can stop short of a wrapped
+    question. The missing span is the same edge, from the template line height,
+    and the checkbox itself does not move.
+    """
+    found = []
+
+    def walk(frag, ox, oy):
+        for block in frag.blocks:
+            edges = block.edges or ()
+            if len(edges) < 4:
+                continue
+            bx = ox + block.x
+            by = oy + block.y
+            if edges[1][0]:
+                found.append((bx + block.w, by, by + block.h, edges[1], "r"))
+            if edges[3][0]:
+                found.append((bx, by, by + block.h, edges[3], "l"))
+        for child in frag.children:
+            walk(child, ox + child.x, oy + child.y)
+
+    walk(line, 0.0, 0.0)
+    if not found or line.h <= 0:
+        return
+    left_x = min(item[0] for item in found)
+    right_x = max(item[0] for item in found)
+    for x, y0, y1, edge, side in found:
+        if side == "r" and abs(x - right_x) > 0.2:
+            continue
+        if side == "l" and abs(x - left_x) > 0.2:
+            continue
+        spans = []
+        if y0 > 0.05:
+            spans.append((0.0, y0))
+        if line.h - y1 > 0.05:
+            spans.append((y1, line.h))
+        _visible, thick, color = edge
+        hidden = (False, thick, color)
+        shown = (True, thick, color)
+        for top, bottom in spans:
+            if side == "r":
+                edges = (hidden, shown, hidden, hidden)
+                bx = x - 1.0
+            else:
+                edges = (hidden, hidden, hidden, shown)
+                bx = x
+            line.blocks.append(Block(
+                kind="text", x=bx, y=top, w=1.0, h=bottom - top, edges=edges,
+            ))
 
 
 def _mark(frag) -> bool:
@@ -702,6 +813,7 @@ def _pack(frags, inner, rtl=False):
             shift = max(0.0, inner - used)
             for item in line.children:
                 item.x += shift
+        _extend_line_rails(line)
         lines.append(line)
         current = []
         used = 0.0
@@ -773,6 +885,13 @@ def _table(el, avail, parts, group, force_w, natural) -> Frag:
         row.y = y
         y += row.h
     frag = Frag(w=outer, h=y, children=rows, splittable=True, name=el.get("name") or "table")
+    # The cell grid is already inside the margin. The subform border is the
+    # section rectangle around that grid: one box, hidden edges omitted.
+    # Rows keep the column lines, so a side rail meets the header above and
+    # the bottom edge below instead of ending in the margin.
+    edges, fill = _border(el)
+    if any(edge[0] for edge in edges) or fill:
+        frag.blocks.append(Block(kind="text", w=frag.w, h=frag.h, edges=edges, fill=fill))
     frag.break_before = _break_before(el)
     frag.keep = _keep(el)
     return frag
@@ -812,6 +931,7 @@ def _row(el, cols, inner, parts, group, index) -> Frag:
         _stretch_leaf(cell, height)
         _center_check(cell, height)
     row = Frag(w=max(inner, x), h=height, children=cells, splittable=False, name=el.get("name") or "row")
+    _extend_line_rails(row)
     edges, fill = _border(el)
     if any(edge[0] for edge in edges) or fill:
         row.blocks.append(Block(kind="text", w=row.w, h=height, edges=edges, fill=fill))

@@ -381,6 +381,11 @@ class Reader(tk.Tk):
         cap = 7000 / max(page_w, page_h)
         return max(0.8, min(ppm, cap))
 
+    def _report_layout(self, page) -> None:
+        issues = getattr(page, "layout_issues", None) or []
+        if issues:
+            self.status.config(text="Layout check: " + "; ".join(issues[:3]))
+
     def _zoom_label(self) -> str:
         if abs(self.user_zoom - 1.0) < 0.03:
             return "Fit"
@@ -407,6 +412,7 @@ class Reader(tk.Tk):
             self._ppm = ppm
             image = render_page(self.pages[self.index], self.values, ppm, self.highlight, active)
             self.page_label.config(text=f"Page {self.index + 1} of {len(self.pages)}    {self._zoom_label()}")
+            self._report_layout(self.pages[self.index])
         elif self.pages and self.path:
             ppm = self._display_ppm()
             raster = self._raster_page(self.index, ppm)
@@ -420,6 +426,7 @@ class Reader(tk.Tk):
                 page, self.values, self._ppm, self.highlight, active, background=raster,
             )
             self.page_label.config(text=f"Page {self.index + 1} of {len(self.pages)}    {self._zoom_label()}")
+            self._report_layout(page)
         else:
             self.page_label.config(text="No pages")
             return False
