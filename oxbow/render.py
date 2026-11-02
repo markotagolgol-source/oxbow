@@ -43,6 +43,49 @@ def ensure_logo(size: int = 64) -> Path:
     return target
 
 
+def scaled_logo(size: int) -> Image.Image:
+    """Copy of assets/logo.png fitted into a size×size slot. The file is not written."""
+    with Image.open(ensure_logo()) as source:
+        return fit_image(source, size)
+
+
+def fit_image(image: Image.Image, size: int) -> Image.Image:
+    """Smooth-scale `image` so it sits inside a square slot. Aspect stays locked."""
+    size = max(1, int(size))
+    fitted = image.convert("RGBA")
+    fitted.thumbnail((size, size), Image.Resampling.LANCZOS)
+    if fitted.size == (size, size):
+        return fitted
+    canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    canvas.paste(fitted, ((size - fitted.width) // 2, (size - fitted.height) // 2), fitted)
+    return canvas
+
+
+def fit_ppm(
+    canvas_w: float,
+    canvas_h: float,
+    page_w: float,
+    page_h: float,
+    zoom: float = 1.0,
+) -> float | None:
+    """Pixels per millimetre so zoom 1 shows the whole page inside the canvas.
+
+    A larger zoom may scroll. None means the canvas is not on screen yet.
+    """
+    if canvas_w < 40 or canvas_h < 40 or page_w <= 0 or page_h <= 0:
+        return None
+    pad = 28
+    fit = min((canvas_w - pad) / page_w, (canvas_h - pad) / page_h)
+    # Fit shows the whole page. The old fit-width fallback made a short wide
+    # window (the giant logo) render a page wider than the visible area.
+    ppm = fit * zoom
+    cap = 7000 / max(page_w, page_h)
+    ppm = min(max(ppm, 0.8), cap)
+    if zoom <= 1.0:
+        ppm = min(ppm, fit)
+    return ppm
+
+
 def _face_files() -> dict:
     global _FACE_FILES
     if _FACE_FILES is not None:

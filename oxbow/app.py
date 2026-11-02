@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import time
 import tkinter as tk
+from io import BytesIO
 from tkinter import filedialog, messagebox, ttk
 
 import pikepdf
@@ -15,7 +16,7 @@ from PIL import Image
 from . import extras
 from .fill import read_acro_values, read_back, save_acro_values, save_filled
 from .layout import PAGE_H, PAGE_W, load_document, load_static_pages
-from .render import PRINT_PPM, ensure_logo, hit_test, input_box, render_page
+from .render import PRINT_PPM, fit_ppm, hit_test, input_box, render_page, scaled_logo
 
 
 class Reader(tk.Tk):
@@ -24,7 +25,7 @@ class Reader(tk.Tk):
         self._apply_screen_dpi()
         self.title("Oxbow")
         try:
-            self._window_icon = tk.PhotoImage(file=str(ensure_logo(48)))
+            self._window_icon = self._logo_photo(self._icon_slot())
             self.iconphoto(True, self._window_icon)
         except tk.TclError:
             self._window_icon = None
@@ -123,10 +124,39 @@ class Reader(tk.Tk):
         self._canvas_size = (0, 0)
         self._blit(self._active_path)
 
+    def _logo_slot(self) -> int:
+        """Toolbar mark in pixels. 32px at 96 DPI, tracking Tk's font scale."""
+        try:
+            scaling = float(self.tk.call("tk", "scaling"))
+        except tk.TclError:
+            scaling = 96 / 72
+        slot = int(round(32 * scaling / (96 / 72)))
+        return max(24, min(64, slot))
+
+    def _icon_slot(self) -> int:
+        """Title-bar mark. The window manager draws it; the file stays 1024."""
+        try:
+            scaling = float(self.tk.call("tk", "scaling"))
+        except tk.TclError:
+            scaling = 96 / 72
+        slot = int(round(48 * scaling / (96 / 72)))
+        return max(32, min(96, slot))
+
+    def _logo_photo(self, size: int) -> tk.PhotoImage:
+        image = scaled_logo(size)
+        buf = BytesIO()
+        image.save(buf, "PNG")
+        try:
+            return tk.PhotoImage(data=buf.getvalue())
+        except tk.TclError:
+            path = os.path.join(tempfile.gettempdir(), f"oxbow-logo-{size}.png")
+            image.save(path, "PNG")
+            return tk.PhotoImage(file=path)
+
     def _build(self):
         bar = ttk.Frame(self, padding=4)
         bar.pack(fill="x")
-        logo = tk.PhotoImage(file=str(ensure_logo(32)))
+        logo = self._logo_photo(self._logo_slot())
         self._logo = logo
         ttk.Label(bar, image=logo).pack(side="left", padx=(0, 6))
         ttk.Button(bar, text="Open", command=self.open_dialog).pack(side="left")
@@ -236,6 +266,7 @@ class Reader(tk.Tk):
         self._fill_outline()
         self._fill_notes()
         self.title(f"Oxbow — {os.path.basename(path)}")
+        self.update_idletasks()
         self._blit()
         kind = "XFA form" if self.xfa else "PDF pages"
         count = len(self.pages) or self._static_count
@@ -359,27 +390,15 @@ class Reader(tk.Tk):
             self.index += 1
             self._blit()
 
-    def _display_ppm(self) -> float:
-        """Pixels per millimetre for one render that fills the current window."""
+    def _display_ppm(self) -> float | None:
+        """Pixels per millimetre for one render of the whole page in this window."""
         self.update_idletasks()
         width = self.canvas.winfo_width()
         height = self.canvas.winfo_height()
-        if width < 40 or height < 40:
-            width, height = 900, 1100
         page = self.pages[self.index] if self.pages and 0 <= self.index < len(self.pages) else None
         page_w = getattr(page, "page_w", 0) or PAGE_W
         page_h = getattr(page, "page_h", 0) or PAGE_H
-        pad = 28
-        fit_w = (width - pad) / page_w
-        fit_h = (height - pad) / page_h
-        fit = min(fit_w, fit_h)
-        # A short window would make the type unreadably small if the whole
-        # page were forced in. Fit the width then, and scroll for the rest.
-        if 2.7 * fit < 16:
-            fit = fit_w
-        ppm = fit * self.user_zoom
-        cap = 7000 / max(page_w, page_h)
-        return max(0.8, min(ppm, cap))
+        return fit_ppm(width, height, page_w, page_h, self.user_zoom)
 
     def _report_layout(self, page) -> None:
         issues = getattr(page, "layout_issues", None) or []
@@ -409,12 +428,22 @@ class Reader(tk.Tk):
             self.index = min(self.index, count - 1)
         if self.pages and self.xfa:
             ppm = self._display_ppm()
+            if ppm is None:
+                self._paint_tries += 1
+                if self._paint_tries < 50:
+                    self.after(40, lambda a=active: self._blit(a))
+                return False
             self._ppm = ppm
             image = render_page(self.pages[self.index], self.values, ppm, self.highlight, active)
             self.page_label.config(text=f"Page {self.index + 1} of {len(self.pages)}    {self._zoom_label()}")
             self._report_layout(self.pages[self.index])
         elif self.pages and self.path:
             ppm = self._display_ppm()
+            if ppm is None:
+                self._paint_tries += 1
+                if self._paint_tries < 50:
+                    self.after(40, lambda a=active: self._blit(a))
+                return False
             raster = self._raster_page(self.index, ppm)
             if raster is None:
                 self.page_label.config(text="No pages")
@@ -431,6 +460,9 @@ class Reader(tk.Tk):
             self.page_label.config(text="No pages")
             return False
         page_w, page_h = image.size
+        # Fit reads the canvas after idle resize. Place the page in that size.
+        cw = self.canvas.winfo_width()
+        ch = self.canvas.winfo_height()
         self._origin_x = max(16, (cw - page_w) // 2) if page_w < cw else 16
         self._origin_y = max(16, (ch - page_h) // 2) if page_h < ch else 16
         frame_path = os.path.join(tempfile.gettempdir(), "oxbow-view.ppm")
@@ -449,6 +481,9 @@ class Reader(tk.Tk):
             max(cw, page_w + self._origin_x + 16),
             max(ch, page_h + self._origin_y + 16),
         ))
+        if page_w <= cw and page_h <= ch:
+            self.canvas.xview_moveto(0)
+            self.canvas.yview_moveto(0)
         self._fill_fields()
         self._sync_outline()
         if active:

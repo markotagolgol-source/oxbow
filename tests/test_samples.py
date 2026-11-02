@@ -1,22 +1,27 @@
 """Behavior of the synthetic sample PDFs. No personal forms."""
 from __future__ import annotations
 
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
 
 import pikepdf
+from PIL import Image
 
 from oxbow.fill import read_back, save_filled
-from oxbow.layout import Block, Page, layout_template, load_document, load_static_pages
+from oxbow.layout import PAGE_H, PAGE_W, Block, Page, layout_template, load_document, load_static_pages
 from oxbow.render import (
     border_overshoots,
     caption_box,
     caption_insets,
     check_page,
+    fit_image,
+    fit_ppm,
     input_box,
     render_page,
     rule_box,
+    scaled_logo,
 )
 from oxbow.xfa import read_packets
 
@@ -375,6 +380,41 @@ class BorderAndCaptionTests(unittest.TestCase):
                 blue += 1
         self.assertEqual(blue, 0)
         self.assertEqual(border_overshoots(page), [])
+
+
+class LogoAndFitTests(unittest.TestCase):
+    def test_scaled_logo_fits_its_slot_and_leaves_the_file(self):
+        path = ROOT / "assets" / "logo.png"
+        before = hashlib.sha256(path.read_bytes()).hexdigest()
+        raw = Image.open(path)
+        self.assertGreater(max(raw.size), 64)
+        raw.close()
+        mark = scaled_logo(48)
+        self.assertEqual(mark.size, (48, 48))
+        small = scaled_logo(32)
+        self.assertEqual(small.size, (32, 32))
+        self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), before)
+        wide = fit_image(Image.new("RGBA", (100, 40), (20, 72, 94, 255)), 20)
+        self.assertEqual(wide.size, (20, 20))
+        self.assertEqual(wide.getpixel((10, 0))[3], 0)
+        self.assertGreater(wide.getpixel((10, 10))[3], 0)
+
+    def test_fit_zoom_keeps_the_page_inside_the_window(self):
+        wide = (4700, 400)
+        ppm = fit_ppm(wide[0], wide[1], PAGE_W, PAGE_H, 1.0)
+        self.assertIsNotNone(ppm)
+        self.assertLessEqual(ppm * PAGE_W, wide[0] - 28)
+        self.assertLessEqual(ppm * PAGE_H, wide[1] - 28)
+        small = fit_ppm(640, 480, PAGE_W, PAGE_H, 1.0)
+        self.assertLessEqual(small * PAGE_W, 640 - 28)
+        self.assertLessEqual(small * PAGE_H, 480 - 28)
+        fitted = fit_ppm(1400, 1800, PAGE_W, PAGE_H, 1.0)
+        zoomed = fit_ppm(1400, 1800, PAGE_W, PAGE_H, 1.2)
+        self.assertGreater(zoomed, fitted)
+        self.assertIsNone(fit_ppm(20, 800, PAGE_W, PAGE_H, 1.0))
+        tiny = fit_ppm(80, 80, PAGE_W, PAGE_H, 1.0)
+        self.assertLessEqual(tiny * PAGE_W, 80 - 28)
+        self.assertLessEqual(tiny * PAGE_H, 80 - 28)
 
 
 if __name__ == "__main__":
